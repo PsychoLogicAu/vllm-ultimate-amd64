@@ -109,7 +109,7 @@ RUN pip install --no-cache-dir --break-system-packages --upgrade "transformers==
     python3 -c "import transformers; print('transformers:', transformers.__version__)"
 
 COPY humming-stub/ /tmp/humming-stub/
-RUN pip install --no-cache-dir /tmp/humming-stub && rm -rf /tmp/humming-stub && \
+RUN pip install --break-system-packages /tmp/humming-stub && rm -rf /tmp/humming-stub && \
     python3 -c "from humming.dtypes import DataType; print('humming-stub: importable')"
 
 COPY verify.py /tmp/verify.py
