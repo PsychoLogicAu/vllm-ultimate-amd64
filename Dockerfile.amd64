@@ -53,7 +53,7 @@ RUN CUDA_LIB=/usr/local/cuda-13.0/targets/x86_64-linux/lib && \
     ls -la $CUDA_LIB/libnvrtc.so* | head -5
 
 # Install PyTorch 2.11.0 + cu130 (matching the upstream AEON pin)
-RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 && \
+RUN pip install --no-cache-dir --break-system-packages torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 && \
     python3 -c "import torch; print('torch:', torch.__version__, '| cuda:', torch.version.cuda, '| available:', torch.cuda.is_available())"
 
 # CUDA 13.0 toolkit + assert nvcc==13.0 before compiling extensions
@@ -64,18 +64,18 @@ RUN update-alternatives --set cuda /usr/local/cuda-13.0 2>/dev/null || true; \
 
 COPY vllm-src/ /build/vllm-src/
 
-RUN pip uninstall -y vllm 2>&1 | tail -3
+RUN pip uninstall -y vllm 2>&1 | tail -3 || true
 
 WORKDIR /build/vllm-src
 RUN CUDA_HOME=/usr/local/cuda-13.0 PATH=/usr/local/cuda-13.0/bin:$PATH \
-    pip install --no-deps -v . 2>&1 | tee /tmp/vllm-install.log | tail -120 && \
+    pip install --no-deps -v --break-system-packages . 2>&1 | tee /tmp/vllm-install.log | tail -120 && \
     echo "[vllm pip install] exit=$?"
 
 # torchcodec: INTENTIONALLY NOT INSTALLED. Same rationale as the arm64 Dockerfile.
 
 # nvidia-cutlass-dsl: upgrade to 4.6.0 + quack-kernels 0.6.x + apache-tvm-ffi 0.1.10
 # (same ABI chain as upstream v0.26.0; see original Dockerfile comments)
-RUN pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.0" "quack-kernels>=0.6,<0.7" "apache-tvm-ffi==0.1.10" 2>&1 | tail -3 && \
+RUN pip install --no-cache-dir --break-system-packages "nvidia-cutlass-dsl[cu13]==4.6.0" "quack-kernels>=0.6,<0.7" "apache-tvm-ffi==0.1.10" 2>&1 | tail -3 && \
     python3 -c "import importlib.metadata as m; \
       c=m.version('nvidia-cutlass-dsl'); q=m.version('quack-kernels'); \
       print('cutlass-dsl:', c, '| quack-kernels:', q); \
@@ -87,7 +87,7 @@ RUN pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.0" "quack-kernels>
 
 # FlashInfer 0.6.14 (matching upstream v0.26.0 pin)
 RUN pip uninstall -y flashinfer-jit-cache 2>&1 | tail -2 || true; \
-    pip install --no-cache-dir --extra-index-url https://flashinfer.ai/whl/ \
+    pip install --no-cache-dir --break-system-packages --extra-index-url https://flashinfer.ai/whl/ \
         "flashinfer-python==0.6.14" "flashinfer-cubin==0.6.14" 2>&1 | tail -3 && \
     (flashinfer download-cubin 2>&1 | tail -3 || echo "[WARN] cubin download failed; runtime JIT fallback") && \
     python3 -c "import flashinfer, importlib.metadata as m; assert flashinfer.__version__=='0.6.14', flashinfer.__version__; \
@@ -95,17 +95,17 @@ RUN pip uninstall -y flashinfer-jit-cache 2>&1 | tail -2 || true; \
       print('flashinfer:', flashinfer.__version__, '+ matched cubin 0.6.14')"
 
 # xgrammar >= 0.2.1 (tool-choice 500s with ImportError otherwise)
-RUN pip install --no-cache-dir "xgrammar>=0.2.1,<1.0.0" 2>&1 | tail -2 && \
+RUN pip install --no-cache-dir --break-system-packages "xgrammar>=0.2.1,<1.0.0" 2>&1 | tail -2 && \
     python3 -c "from xgrammar import normalize_tool_choice; print('xgrammar: normalize_tool_choice OK')"
 
-RUN pip install --no-cache-dir "scipy>=1.11" 2>&1 | tail -3 && \
-    pip install --no-cache-dir --no-deps \
+RUN pip install --no-cache-dir --break-system-packages "scipy>=1.11" 2>&1 | tail -3 && \
+    pip install --no-cache-dir --break-system-packages --no-deps \
       "turboquant @ git+https://github.com/AEON-7/turboquant.git@fix/cuda-graph-safe-qjl-powers" \
       2>&1 | tail -3 || \
     echo "[WARN] turboquant install attempted; check logs above if needed"
 
 # Pinned stable transformers (>=5.5.3 floor in v0.25.0; 5.12.1 fleet-validated)
-RUN pip install --no-cache-dir --upgrade "transformers==5.12.1" 2>&1 | tail -3 && \
+RUN pip install --no-cache-dir --break-system-packages --upgrade "transformers==5.12.1" 2>&1 | tail -3 && \
     python3 -c "import transformers; print('transformers:', transformers.__version__)"
 
 COPY humming-stub/ /tmp/humming-stub/
