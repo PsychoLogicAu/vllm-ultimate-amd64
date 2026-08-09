@@ -1,0 +1,159 @@
+# Ultimate vLLM image for RTX 5090 / Consumer Blackwell (sm_120) — v0.26.0 base (amd64)
+# AMD64 port of the DGX Spark Dockerfile:
+#   - TORCH_CUDA_ARCH_LIST: 12.1a (GB10) -> 12.0 (RTX 5090 / RTX 5080)
+#   - Base: official NVIDIA CUDA image + PyTorch instead of AEON arm64 image
+#   - CUDA paths: sbsa-linux (ARM64) replaced with x86_64-linux
+#   - All AEON carries intact: NVFP4-KV (#44389), DFlash SWA (#40898), prefix-cache (#41703)
+#     + dflash-blocktable-unpad, cudagraph_align, UMA clamp, NVFP4_AWQ support
+
+FROM nvidia/cuda:13.0.2-base-ubuntu24.04 AS base
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENV TORCH_CUDA_ARCH_LIST="12.0"
+ENV ENABLE_NVFP4_SM100=0
+ENV CCACHE_DISABLE=1
+ENV CMAKE_BUILD_PARALLEL_LEVEL=8
+ENV MAX_JOBS=12
+ENV NVCC_THREADS=2
+ENV SETUPTOOLS_SCM_PRETEND_VERSION="0.26.0+aeon.sm120.amd64"
+ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM="0.26.0+aeon.sm120.amd64"
+# Phase-1 MRv2 pin: keep the carried V1 GPUModelRunner for all models (see header comment in original).
+ENV VLLM_USE_V2_MODEL_RUNNER=0
+
+WORKDIR /build
+
+# Install build deps + dev tools
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git ca-certificates ffmpeg \
+        gcc-12 g++-12 \
+        cuda-nvrtc-dev-13-0 \
+        libcusparse-dev-13-0 \
+        libcublas-dev-13-0 \
+        libcusolver-dev-13-0 \
+        libcufft-dev-13-0 \
+        libcurand-dev-13-0 \
+        libnvjitlink-dev-13-0 \
+        python3 python3-pip python3-dev \
+        build-essential && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# GCC >= 12 for C++20 (#44923); base ships 11.4
+ENV CC=gcc-12
+ENV CXX=g++-12
+ENV CUDAHOSTCXX=g++-12
+
+# Create nvrtc symlink if needed (x86_64 variant)
+RUN CUDA_LIB=/usr/local/cuda-13.0/targets/x86_64-linux/lib && \
+    if [ ! -f $CUDA_LIB/libnvrtc.so ] && [ -f $CUDA_LIB/libnvrtc.so.13.0.88 ]; then \
+        ln -sf $CUDA_LIB/libnvrtc.so.13.0.88 $CUDA_LIB/libnvrtc.so; \
+        echo "Created libnvrtc.so symlink"; \
+    fi && \
+    ls -la $CUDA_LIB/libnvrtc.so* | head -5
+
+# Install PyTorch 2.11.0 + cu130 (matching the upstream AEON pin)
+RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 && \
+    python3 -c "import torch; print('torch:', torch.__version__, '| cuda:', torch.version.cuda, '| available:', torch.cuda.is_available())"
+
+# CUDA 13.0 toolkit + assert nvcc==13.0 before compiling extensions
+RUN update-alternatives --set cuda /usr/local/cuda-13.0 2>/dev/null || true; \
+    export CUDA_HOME=/usr/local/cuda-13.0 PATH=/usr/local/cuda-13.0/bin:$PATH; \
+    nvcc --version | sed -n 's/.*release \([0-9.]\+\)/\1/p' | head -1; \
+    test "$(nvcc --version | sed -n 's/.*release \([0-9.]\+\)/\1/p' | head -1)" = "13.0"
+
+COPY vllm-src/ /build/vllm-src/
+
+RUN pip uninstall -y vllm 2>&1 | tail -3
+
+WORKDIR /build/vllm-src
+RUN CUDA_HOME=/usr/local/cuda-13.0 PATH=/usr/local/cuda-13.0/bin:$PATH \
+    pip install --no-deps -v . 2>&1 | tee /tmp/vllm-install.log | tail -120 && \
+    echo "[vllm pip install] exit=$?"
+
+# torchcodec: INTENTIONALLY NOT INSTALLED. Same rationale as the arm64 Dockerfile.
+
+# nvidia-cutlass-dsl: upgrade to 4.6.0 + quack-kernels 0.6.x + apache-tvm-ffi 0.1.10
+# (same ABI chain as upstream v0.26.0; see original Dockerfile comments)
+RUN pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.0" "quack-kernels>=0.6,<0.7" "apache-tvm-ffi==0.1.10" 2>&1 | tail -3 && \
+    python3 -c "import importlib.metadata as m; \
+      c=m.version('nvidia-cutlass-dsl'); q=m.version('quack-kernels'); \
+      print('cutlass-dsl:', c, '| quack-kernels:', q); \
+      assert c.startswith('4.6'), c; assert q.startswith('0.6'), q; \
+      t=m.version('apache-tvm-ffi'); print('apache-tvm-ffi:', t); assert t=='0.1.10', t; \
+      import inspect as _i; from tvm_ffi.utils.kwargs_wrapper import make_kwargs_wrapper as _mkw; \
+      assert 'map_dataclass_to_tuple' in _i.signature(_mkw).parameters, 'tvm-ffi too old for cutlass 4.6 cute.compile'; \
+      from quack import layout_utils; print('quack/cutlass/tvm-ffi ABI compatible')"
+
+# FlashInfer 0.6.14 (matching upstream v0.26.0 pin)
+RUN pip uninstall -y flashinfer-jit-cache 2>&1 | tail -2 || true; \
+    pip install --no-cache-dir --extra-index-url https://flashinfer.ai/whl/ \
+        "flashinfer-python==0.6.14" "flashinfer-cubin==0.6.14" 2>&1 | tail -3 && \
+    (flashinfer download-cubin 2>&1 | tail -3 || echo "[WARN] cubin download failed; runtime JIT fallback") && \
+    python3 -c "import flashinfer, importlib.metadata as m; assert flashinfer.__version__=='0.6.14', flashinfer.__version__; \
+      import importlib.metadata as mm; assert mm.version('flashinfer-cubin')=='0.6.14', mm.version('flashinfer-cubin'); \
+      print('flashinfer:', flashinfer.__version__, '+ matched cubin 0.6.14')"
+
+# xgrammar >= 0.2.1 (tool-choice 500s with ImportError otherwise)
+RUN pip install --no-cache-dir "xgrammar>=0.2.1,<1.0.0" 2>&1 | tail -2 && \
+    python3 -c "from xgrammar import normalize_tool_choice; print('xgrammar: normalize_tool_choice OK')"
+
+RUN pip install --no-cache-dir "scipy>=1.11" 2>&1 | tail -3 && \
+    pip install --no-cache-dir --no-deps \
+      "turboquant @ git+https://github.com/AEON-7/turboquant.git@fix/cuda-graph-safe-qjl-powers" \
+      2>&1 | tail -3 || \
+    echo "[WARN] turboquant install attempted; check logs above if needed"
+
+# Pinned stable transformers (>=5.5.3 floor in v0.25.0; 5.12.1 fleet-validated)
+RUN pip install --no-cache-dir --upgrade "transformers==5.12.1" 2>&1 | tail -3 && \
+    python3 -c "import transformers; print('transformers:', transformers.__version__)"
+
+COPY humming-stub/ /tmp/humming-stub/
+RUN pip install --no-cache-dir /tmp/humming-stub && rm -rf /tmp/humming-stub && \
+    python3 -c "from humming.dtypes import DataType; print('humming-stub: importable')"
+
+COPY verify.py /tmp/verify.py
+RUN python3 /tmp/verify.py && rm /tmp/verify.py
+
+# Smoke (from WORKDIR / so cwd doesn't shadow the installed pkg; dlopen stable-ABI vs the driver stub):
+# confirm all load-bearing AEON symbols survived the 0.25.0 merge + the MRv2 V1 pin is honored.
+WORKDIR /
+RUN mkdir -p /tmp/cuda-stub && \
+    ln -s /usr/local/cuda-13.0/targets/x86_64-linux/lib/stubs/libcuda.so /tmp/cuda-stub/libcuda.so.1 && \
+    LD_LIBRARY_PATH=/tmp/cuda-stub:$LD_LIBRARY_PATH python3 -c "\
+import vllm._C_stable_libtorch; import vllm._moe_C_stable_libtorch; \
+import vllm, inspect; assert vllm.__version__.startswith('0.26.0'), vllm.__version__; \
+from vllm import LLM, SamplingParams; from vllm.config import VllmConfig; \
+import vllm.model_executor.models.qwen3_dflash as q; assert 'sliding_attention_layer_names' in inspect.getsource(q), 'SWA lost'; \
+import vllm.v1.spec_decode.utils as u; assert 'is_valid_ctx' in inspect.getsource(u), 'ctx-slot mask lost'; \
+import vllm.v1.attention.backends.triton_attn as t; assert 'nvfp4' in inspect.getsource(t).lower(), 'NVFP4-KV lost'; \
+import vllm.v1.spec_decode.dflash as d; assert 'dflash-blocktable-unpad' in inspect.getsource(d), 'blocktable slice lost'; \
+import vllm.config.compilation as cc; assert 'cudagraph_align_spec_decode_all_modes' in inspect.getsource(cc), 'cudagraph align lost'; \
+import vllm.v1.worker.gpu_model_runner as gmr; assert 'uma-negative-cudagraph-estimate-clamp' in inspect.getsource(gmr), 'UMA clamp lost'; \
+import vllm.envs as e; assert e.VLLM_USE_V2_MODEL_RUNNER == 0 or e.VLLM_USE_V2_MODEL_RUNNER is False, 'V2 runner not pinned off'; \
+import vllm.v1.worker.gpu.spec_decode.eagle.utils as eu; assert hasattr(eu, 'get_target_lm_head'), 'upstream #47914 lm_head helper missing'; \
+import vllm.config.vllm as cv; assert '_dflash_needs_multi_kv_group' in inspect.getsource(cv), 'v0.26.0 force-V2 trigger missing'; \
+assert inspect.getsource(cv.VllmConfig.use_v2_model_runner.fget).index('VLLM_USE_V2_MODEL_RUNNER') < inspect.getsource(cv.VllmConfig.use_v2_model_runner.fget).index('_dflash_needs_multi_kv_group'), 'env pin no longer precedes the force-V2 trigger'; \
+import vllm.utils.torch_utils as tu; assert hasattr(tu, 'nvfp4_kv_cache_split_views'), 'nvfp4 split helper missing (ImportError at boot)'; \
+assert 'as_strided' not in tu._nvfp4_split_data_scale.__code__.co_names, 'nvfp4 splitter reverted to upstream as_strided math (NHD-unsafe)'; \
+assert hasattr(q, 'dflash_has_any_non_causal'), 'dflash_has_any_non_causal missing (V1 proposer ImportError)'; \
+import vllm.multimodal.video as vid; \
+print('vllm', vllm.__version__, '+aeon import OK; carries present (SWA/ctx-mask/NVFP4-KV/blocktable/cudagraph/UMA); V1 pin precedes force-V2; nvfp4 views slicing-based; video graceful-degrade OK')" && \
+    rm -rf /tmp/cuda-stub
+
+# AEON build gate: NVFP4 KV data/scale views must be DISJOINT under BOTH cache layouts
+COPY nvfp4_kv_gate.py /tmp/nvfp4_kv_gate.py
+RUN python3 /tmp/nvfp4_kv_gate.py && rm /tmp/nvfp4_kv_gate.py
+
+RUN rm -rf /build /root/.cache/pip
+
+LABEL ai.aeon.vllm_base="vLLM 0.26.0 (from-source, sm_120 amd64)" \
+      ai.aeon.model="fleet: Gemma-4-26B-A4B, Qwen3.6-27B, Qwen3.6-35B-A3B" \
+      ai.aeon.hardware="RTX 5090 / 5080 SM120 amd64" \
+      ai.aeon.features="gemma4,qwen3.6,dflash,dflash-highconc-fix,mrv2-lmhead-fix,consumer-blackwell-ready,nvfp4,nvfp4-kv,fp8-kv,swizzled-scale-zeroinit,flashinfer-0.6.14,cutlass-dsl-4.6.0,uma-clamp,kv-cache-bytes-cachehash-fix,tp2-fusion-guard,v1-pinned,tp2-ready,turboquant,tool-calling" \
+      org.opencontainers.image.description="AEON vLLM Ultimate — vLLM 0.26.0 built from source for consumer Blackwell (sm_120). AMD64 port of the DGX Spark build. Carries Triton NVFP4-KV (#44389), DFlash SWA + prefix-cache + high-concurrency fixes, UMA/cudagraph clamps, FlashInfer 0.6.14." \
+      org.opencontainers.image.documentation="https://github.com/AEON-7/vllm-ultimate-dgx-spark" \
+      org.opencontainers.image.source="https://github.com/AEON-7/vllm-ultimate-dgx-spark" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+ENTRYPOINT ["/bin/bash"]
